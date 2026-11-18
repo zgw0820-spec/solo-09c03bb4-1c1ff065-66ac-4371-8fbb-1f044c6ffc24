@@ -1,4 +1,4 @@
-"""故障日志服务：旧版/新版检索 + legacy_summary 列退役协调。
+"""故障日志服务：事件入仓归并 + 旧版/新版检索 + legacy_summary 列退役协调。
 
 部署形态：两个本服务实例（app1/app2）共享同一个 PostgreSQL 16 数据库。
 """
@@ -7,14 +7,17 @@ from __future__ import annotations
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
+from .ingest import EventContentConflict, EventInput, WINDOW_SECONDS, ingest_event
 from .retirement import ADVISORY_LOCK_KEY, ensure_retirement_worker
+from .schema import ensure_ingest_schema
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://ops:ops_password@localhost:5432/faultdb"
@@ -24,10 +27,23 @@ ENABLE_TEST_HOOKS = os.environ.get("ENABLE_TEST_HOOKS", "").lower() in {"1", "tr
 MAX_SLOW_MS = 120_000  # slow_ms 演示参数上限
 
 
+class EventIn(BaseModel):
+    """入仓事件：event_id + 级别 + 服务 + 消息 + 摘要。"""
+
+    event_id: str = Field(..., min_length=1, max_length=200, description="事件号，全局唯一；重试需完全一致")
+    severity: Literal["INFO", "WARN", "ERROR", "CRITICAL"] = Field(..., description="级别")
+    service: str = Field(..., min_length=1, max_length=200, description="服务名")
+    message: str = Field(..., min_length=1, description="原始错误消息")
+    summary: str = Field(..., min_length=1, description="摘要；仅窗口内首条事件的摘要会展示")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8)
     app.state.fail_drops_remaining = 0  # 测试钩子计数器（仅 ENABLE_TEST_HOOKS 时可被武装）
+    async with app.state.pool.acquire() as conn:
+        # 已有库升级/实例重启时补齐入仓列与去重表；绝不重建已退役的旧列。
+        await ensure_ingest_schema(conn)
     # 退役途中实例重启：发现库里仍是 retiring，自动续跑退役任务；
     # 重启期间及之后旧版检索依然被拒绝（状态在共享库中）。
     async with app.state.pool.acquire() as conn:
@@ -40,9 +56,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Fault Log Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "故障日志检索服务：旧版检索读 `legacy_summary`，新版检索读 `summary`；"
+        "故障日志服务：`POST /api/events` 事件入仓（按服务/级别/消息在 60 秒窗口内归并）；"
+        "旧版检索读 `legacy_summary`，新版检索读 `summary`；"
         "`POST /api/retirement` 受理 legacy_summary 列退役，两个实例通过共享数据库协调。"
     ),
     lifespan=lifespan,
@@ -121,7 +138,8 @@ async def legacy_search(
                 await conn.execute("SELECT pg_sleep($1)", slow_ms / 1000.0)
             rows = await conn.fetch(
                 """
-                SELECT id, created_at, severity, service, message, legacy_summary
+                SELECT id, created_at, severity, service, message, legacy_summary,
+                       event_count, last_seen_at
                   FROM fault_logs
                  WHERE ($1::text IS NULL OR severity = $1)
                  ORDER BY id
@@ -138,18 +156,23 @@ async def legacy_search(
     }
 
 
-@app.get("/api/v2/fault-logs", tags=["v2"], summary="新版检索（读 summary）")
+@app.get("/api/v2/fault-logs", tags=["v2"], summary="新版检索（读 summary，含归并次数与末次时间）")
 async def v2_search(
     request: Request,
     severity: str | None = Query(None, description="按严重级别过滤：INFO/WARN/ERROR/CRITICAL"),
     limit: int = Query(50, ge=1, le=500),
 ):
-    """读取 `summary` 列。退役的任何阶段都可用。"""
+    """读取 `summary` 列。退役的任何阶段都可用。
+
+    每行附带 `event_count`（60 秒窗口内累计次数）与 `last_seen_at`（末次事件时间）；
+    预置的历史日志没有入仓事件，按一次显示（`event_count=1`，`last_seen_at=created_at`）。
+    """
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, created_at, severity, service, message, summary
+            SELECT id, created_at, severity, service, message, summary,
+                   event_count, last_seen_at
               FROM fault_logs
              WHERE ($1::text IS NULL OR severity = $1)
              ORDER BY id
@@ -164,6 +187,52 @@ async def v2_search(
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+
+
+@app.post(
+    "/api/events",
+    tags=["ingest"],
+    summary="事件入仓（按服务/级别/消息在 60 秒窗口内归并）",
+    status_code=201,
+    responses={
+        200: {"description": "同一 event_id 的重复投递：不重复计数，返回原日志"},
+        201: {"description": "已计入窗口：新建日志或累加次数"},
+        409: {"description": "event_id 已存在但内容不同（事件号复用被拒绝）"},
+    },
+)
+async def create_event(event: EventIn, request: Request):
+    """接收一条事件并归并到 60 秒窗口。
+
+    - 首次出现的 `service + severity + message` 组合从该事件起计时 60 秒；
+    - 窗口内同组合事件累加 `event_count`、刷新 `last_seen_at`，摘要沿用首条；
+    - 超窗新建一条日志；
+    - `event_id` 重试（内容一致）幂等：返回 200、`deduplicated=true`，计数不变；
+    - `event_id` 换内容复用：409，不写入任何数据；
+    - 两个实例并发入仓由数据库咨询锁串行化，同一窗口不会被拆成两条。
+    """
+    pool = request.app.state.pool
+    try:
+        payload = await ingest_event(
+            pool,
+            EventInput(
+                event_id=event.event_id,
+                severity=event.severity,
+                service=event.service,
+                message=event.message,
+                summary=event.summary,
+            ),
+        )
+    except EventContentConflict:
+        raise HTTPException(
+            status_code=409,
+            detail=f"event_id {event.event_id!r} 已用于另一份内容，拒绝复用事件号",
+        )
+    payload["instance"] = INSTANCE_ID
+    payload["window_seconds"] = WINDOW_SECONDS
+    return JSONResponse(
+        jsonable_encoder(payload),
+        status_code=200 if payload["deduplicated"] else 201,
+    )
 
 
 @app.post(

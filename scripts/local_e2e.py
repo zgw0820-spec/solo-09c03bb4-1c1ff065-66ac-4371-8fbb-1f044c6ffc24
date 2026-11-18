@@ -4,7 +4,7 @@
   1. 用 pgserver（pip 包内嵌 PostgreSQL 16）初始化并启动一个数据库；
   2. 应用 db/init/01_init.sql 预置故障日志；
   3. 启动两个 uvicorn 实例（127.0.0.1:8001 / :8002）共享该库；
-  4. 运行 scripts/e2e.py 的全部场景（含长查询交错、失败重试、并发退役）；
+  4. 运行 scripts/e2e.py 的全部场景（检索/退役/入仓归并/并发/降级）；
   5. 运行“退役途中实例崩溃重启”场景（kill -9 后重启，验证状态保留与自动续跑）。
 
 用法： python3 scripts/local_e2e.py
@@ -84,7 +84,7 @@ class AppInstance:
 
 def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
                                     dsn: str, ck: e2e.Check) -> None:
-    print("\n== 场景 4：退役途中实例崩溃重启 -> 状态保留、旧版不复单、自动续跑 ==")
+    print("\n== 场景 9：退役途中实例崩溃重启 -> 状态保留、旧版不复单、自动续跑 ==")
     e2e.reset_db(dsn)
     results: dict[str, httpx.Response] = {}
 
@@ -100,6 +100,16 @@ def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
        "app1 受理退役(202/retiring)", f"got {r.status_code}")
     time.sleep(1.0)  # app1 的后台任务正在等咨询锁
 
+    # 退役途中（retiring）先入仓一条事件；实例重启后该事件的重试必须去重、不重复计数
+    msg = "ingest-restart-check"
+    ev = {"event_id": "evt-restart-1", "severity": "ERROR", "service": "restart-svc",
+          "message": msg, "summary": "重启前摘要"}
+    r = e2e.post(f"{APP2}/api/events", json=ev)
+    ck(r.status_code == 201 and r.json()["used_legacy_column"],
+       "retiring 期间（重启前）入仓成功且写旧列",
+       f"got {r.status_code} {r.text[:160]}")
+    first_id = r.json()["fault_log_id"]
+
     app1.kill()  # 退役途中 app1 宕机
 
     st = e2e.retirement_state(APP2)
@@ -114,6 +124,24 @@ def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
 
     r = e2e.get(f"{APP1}/api/v1/legacy/fault-logs")
     ck(r.status_code == 409, "app1 重启后旧版仍拒单(409，不能重新接单)", f"got {r.status_code}")
+
+    # 重启后的实例：retiring 期间入仓仍写旧列；同 event_id 重试不重复计数
+    r = e2e.post(f"{APP1}/api/events", json=ev)
+    ck(r.status_code == 200 and r.json()["deduplicated"] and r.json()["event_count"] == 1,
+       "重启后重试退役途中的事件：不重复计数（200/deduplicated）",
+       f"got {r.status_code} {r.text[:160]}")
+    r = e2e.post(f"{APP1}/api/events",
+                 json={**ev, "event_id": "evt-restart-2", "summary": "重启后摘要"})
+    ck(r.status_code == 201 and r.json()["event_count"] == 2
+       and r.json()["fault_log_id"] == first_id,
+       "重启后 retiring 期间入仓归并到原窗口（计数延续）",
+       f"got {r.status_code} {r.text[:160]}")
+    r = e2e.post(f"{APP1}/api/events",
+                 json={**ev, "event_id": "evt-restart-2b",
+                       "message": msg + "-new", "summary": "重启后新窗口"})
+    ck(r.status_code == 201 and r.json()["used_legacy_column"],
+       "重启后 retiring 期间新建窗口仍写旧列",
+       f"got {r.status_code} {r.text[:160]}")
 
     t.join(timeout=40)
     slow = results.get("slow")
@@ -131,6 +159,21 @@ def scenario_restart_mid_retirement(app1: AppInstance, app2: AppInstance,
         ck(r.status_code == 410, f"{name} 最终旧版 410", f"got {r.status_code}")
         r = e2e.get(f"{base}/api/v2/fault-logs")
         ck(r.status_code == 200, f"{name} 最终新版仍可用(200)")
+
+    # 退役完成后实例重启：入仓继续可用、不写旧列、原窗口计数保留
+    app2.stop()
+    app2.start()
+    r = e2e.post(f"{APP2}/api/events",
+                 json={**ev, "event_id": "evt-restart-3", "summary": "退役后摘要"})
+    ck(r.status_code == 201 and r.json()["event_count"] == 3
+       and not r.json()["used_legacy_column"],
+       "退役完成后重启实例：入仓仍可用、不写旧列、计数延续",
+       f"got {r.status_code} {r.text[:160]}")
+    item = next((i for i in e2e.get(f"{APP2}/api/v2/fault-logs",
+                                    params={"limit": 500}).json()["items"]
+                 if i["message"] == msg), None)
+    ck(item is not None and item["event_count"] == 3 and item["summary"] == "重启前摘要",
+       "重启后新版检索仍显示原窗口累计次数与首条摘要", f"item={item}")
 
 
 def main() -> int:
@@ -164,10 +207,10 @@ def main() -> int:
         app1.start()
         app2.start()
 
-        # 场景 1-3（每个非初始场景前自行重置数据库）
+        # 场景 1-8（每个场景前自行重置数据库）
         e2e.run_scenarios(APP1, APP2, dsn, [], ck)
 
-        # 场景 4：崩溃重启
+        # 场景 9：崩溃重启
         scenario_restart_mid_retirement(app1, app2, dsn, ck)
     finally:
         app1.stop()

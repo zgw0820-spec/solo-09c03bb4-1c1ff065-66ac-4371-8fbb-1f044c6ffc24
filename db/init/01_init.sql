@@ -1,21 +1,28 @@
 -- 故障日志库初始化脚本。
 -- Docker 首次启动时由 /docker-entrypoint-initdb.d 执行；本地自测也会重复执行，
 -- 因此写成可重入（先 DROP 再 CREATE）。
+DROP TABLE IF EXISTS event_ingestions CASCADE;
 DROP TABLE IF EXISTS fault_logs CASCADE;
 DROP TABLE IF EXISTS retirement_state CASCADE;
 
 -- 故障日志表：summary 为新版列，legacy_summary 为待退役旧列。
+-- event_count / last_seen_at 为事件入仓的归并结果：窗口内的事件累加到同一条日志。
 CREATE TABLE fault_logs (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    created_at     timestamptz NOT NULL DEFAULT now(),
+    created_at     timestamptz NOT NULL DEFAULT now(),  -- 窗口内首条事件时间
     severity       text NOT NULL CHECK (severity IN ('INFO','WARN','ERROR','CRITICAL')),
     service        text NOT NULL,
     message        text NOT NULL,
-    summary        text NOT NULL,           -- 新版检索读取
-    legacy_summary text NOT NULL            -- 旧版检索读取（待退役）
+    summary        text NOT NULL,           -- 新版检索读取；窗口内首条事件的摘要
+    legacy_summary text NOT NULL,           -- 旧版检索读取（待退役）
+    event_count    integer NOT NULL DEFAULT 1 CHECK (event_count >= 1),
+    last_seen_at   timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_fault_logs_severity ON fault_logs (severity);
+-- 入仓时按 (service, severity, message) 找最近一次窗口日志。
+CREATE INDEX idx_fault_logs_window
+    ON fault_logs (service, severity, message, created_at DESC);
 
 INSERT INTO fault_logs (created_at, severity, service, message, summary, legacy_summary) VALUES
   (now() - interval '12 days',  'CRITICAL', 'auth-gateway',   'OAuth signing key rotation failed; login error rate spiked to 38%',
@@ -61,6 +68,11 @@ INSERT INTO fault_logs (created_at, severity, service, message, summary, legacy_
    'log-pipeline: 3 个节点 Fluentd 缓冲接近上限，已清理并扩容。',
    'LEGACY|WARN|log-pipeline|fluentd-buffer|3-nodes-near-cap|expanded');
 
+-- 预置历史日志没有对应的入仓事件：按一次显示，末次时间即首条时间。
+UPDATE fault_logs
+   SET event_count = 1,
+       last_seen_at = created_at;
+
 -- 退役协调状态机（单行）：active -> retiring -> retired。
 CREATE TABLE retirement_state (
     id              smallint PRIMARY KEY CHECK (id = 1),
@@ -73,3 +85,12 @@ CREATE TABLE retirement_state (
 );
 
 INSERT INTO retirement_state (id, status) VALUES (1, 'active');
+
+-- 事件入仓去重表：同一 event_id 只登记一次（与首条计数同事务提交）。
+-- event_id 被复用且内容不同时由应用层拒绝（409），此处只存内容指纹。
+CREATE TABLE event_ingestions (
+    event_id     text PRIMARY KEY,
+    content_hash text NOT NULL,
+    fault_log_id bigint NOT NULL REFERENCES fault_logs (id) ON DELETE CASCADE,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
